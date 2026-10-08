@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Worm Prototype - Fáze 5 (refaktoring A)</title>
+    <title>Worm Prototype - Fáze 6</title>
     <style>
         body {
             background-color: #1e1e1e;
@@ -48,7 +48,7 @@
 <body>
 
     <div id="game-container">
-        <h1>Worm Proto - Fáze 5 (NPC Brouci) · refaktoring A</h1>
+        <h1>Worm Proto - Fáze 6 (Brouci: velikostní kategorie a střety)</h1>
         <canvas id="gameCanvas" width="1600" height="900"></canvas>
         <div class="controls">
             Hráč 1: <b>Šipky VLEVO / VPRAVO</b> · Hráč 2: <b>A / D</b> (v režimu 1 hráče fungují obě) ·
@@ -74,24 +74,40 @@
                 stoneTerrain: '#261714',  // stopa kamene v terénu
             },
             players: { count: 1, startX: 100, spacingY: 240 },
+            // Velikostní kategorie – společné pro červa i brouky (stejná kategorie = stejný rádius).
+            // Rádius = baseRadius × size. Červ: kat. 1–4, brouci: kat. 1–5.
+            tiers: {
+                baseRadius: 25,
+                sizes: [0.25, 0.50, 0.75, 1.00, 1.25],
+            },
             worm: {
-                radius: { start: 9, max: 25 },
-                length: { start: 75, max: 300 },
+                // Rádius roste plynule od rádiusu kat. start do rádiusu kat. max;
+                // kategorie (pro pravidla) = nejvyšší, jejíž rádius červ už dosáhl → skáče po stupních.
+                tier: { start: 0, max: 3 },                  // 0-based index do tiers.sizes (kat. 1 → kat. 4)
+                length: { start: 75, max: 300 },             // px, roste úměrně rádiusu
                 speed:  { dirt: 101.25, tunnel: 168.75 },  // px/s  (1.6875 / 2.8125 px/frame)
                 sizeSpeedBonus: 0.5,                         // na max. velikosti ×1.5
                 rootSlow: 0.25,                              // rychlost v kořeni = 25 % základní
                 turnRate: 3,                                 // rad/s (0.05 rad/frame)
                 wave: { freq: 12, amp: 0.15, turnDamp: 0.2 },// freq rad/s (0.2/frame)
-                growth: { radius: 1.6875, length: 16.875 },  // px/s při žraní kořene → max za ≈ 9,5 s
+                growth: { radius: 2 },                       // px/s při žraní kořene → 6,25 → 25 za ≈ 9,4 s (≈ 3,1 s na kategorii)
                 digExtra: 2,                                 // tunel = radius + 2
                 sampling: { count: 5, spread: Math.PI / 4, ahead: 5 },
                 neckProtection: 3.5,                         // × radius
                 selfHitDist: 1.8,                            // × radius
             },
             bug: {
-                count: 30,
+                count: 60,
                 spawnMinX: 500,
-                radius: { min: 4.5, endFactor: 1.25 },      // na konci mapy až 125 % max. rádiusu červa
+                // Vzhled podle kategorie (CONFIG.tiers): čím větší, tím tmavší = tím nebezpečnější.
+                tierLooks: [
+                    { color: '#D2B48C', eye: '#000000' },   // 1 –  6,25 px
+                    { color: '#A9744F', eye: '#000000' },   // 2 – 12,5 px
+                    { color: '#7A4A2E', eye: '#000000' },   // 3 – 18,75 px
+                    { color: '#4E2A1C', eye: '#E0C080' },   // 4 – 25 px (= max. červ)
+                    { color: '#21100B', eye: '#FF5030' },   // 5 – 31,25 px
+                ],
+                tierByProgress: true,                        // true: vyšší kategorie se odemykají s postupem mapou
                 speed:  { dirt: 100.8, tunnel: 168 },        // px/s  (1.68 / 2.8 px/frame)
                 wakeDistance: 300,                           // px za pravým okrajem obrazovky
                 turn: {
@@ -102,6 +118,19 @@
                 walkAnim: 15,                                // rad/s (0.25/frame)
                 digExtra: 1,
                 sampling: { count: 3, spread: Math.PI / 4, ahead: 5 },
+            },
+            // Střety červ ↔ brouk podle kategorií.
+            // Brouk se dotkne hlavy = červ narazil do brouka; dotkne se těla = brouk narazil do červa.
+            clash: {
+                eatGrowChance: [0.4, 0.7, 1.0],              // šance na růst (jinak zrychlení) podle rozdílu kat. 1/2/3
+                eatGrowth: 0.25,                             // růst = 0.25 × rádius sežraného brouka
+                boost: { factor: 1.4, duration: 2 },         // × rychlost, s
+                slow:  { factor: 0.5, duration: 1 },         // × rychlost, s
+                wormStun: 1.5,                               // s – úplné zastavení
+                bugStun: 2,                                  // s
+                bite: 0.5,                                   // zmenšení = 0.5 × krok kategorie (6,25 px)
+                pairCooldown: 1,                             // s – dvojice červ–brouk po střetu
+                wormImmuneAfterStun: 1,                      // s – po omráčení (proti stun-locku)
             },
             stones: { count: 500, maxAreaRatio: 0.20, rx: [15, 45], ry: [10, 30], safeRadius: 150, maxAttempts: 10 },
             roots:  { systems: 60, marginX: 400, radius: [20, 40], segments: [20, 50], shrink: 0.90, minRadius: 3, stepY: 0.8 },
@@ -131,6 +160,21 @@
 
         function randRange(rng, range) {
             return range[0] + rng() * (range[1] - range[0]);
+        }
+
+        // Rádius velikostní kategorie (0-based index)
+        function tierRadius(tier) {
+            return CONFIG.tiers.baseRadius * CONFIG.tiers.sizes[tier];
+        }
+
+        // Nejvyšší kategorie, jejíž rádius je ≤ radius (min. 0)
+        function tierForRadius(radius) {
+            const sizes = CONFIG.tiers.sizes;
+            let tier = 0;
+            for (let i = 0; i < sizes.length; i++) {
+                if (radius + 1e-6 >= tierRadius(i)) tier = i;
+            }
+            return tier;
         }
 
         function newRandomSeed() {
@@ -300,7 +344,8 @@
                 this.x = x;
                 this.y = y;
 
-                this.radius = cfg.radius.start;
+                // Velikost roste plynule; kategorie (this.tier) se z ní odvozuje po skocích
+                this.radius = tierRadius(cfg.tier.start);
                 this.targetLength = cfg.length.start;
 
                 this.angle = 0;
@@ -312,11 +357,69 @@
 
                 this.body = [];
                 this.currentActualSpeed = 0;   // px/s – pro HUD
+
+                // Stavové efekty ze střetů s brouky (zbývající čas v s)
+                this.stunTime = 0;
+                this.slowTime = 0;
+                this.boostTime = 0;
+                this.immuneTime = 0;
+                this.stats = { eaten: 0, bitten: 0 };
             }
 
+            get isStunned() {
+                return this.stunTime > 0;
+            }
+
+            // Násobitel rychlosti ze stavových efektů
+            get effectSpeedFactor() {
+                const c = CONFIG.clash;
+                if (this.isStunned) return 0;
+                return (this.slowTime > 0 ? c.slow.factor : 1) * (this.boostTime > 0 ? c.boost.factor : 1);
+            }
+
+            stun() {
+                const c = CONFIG.clash;
+                this.stunTime = c.wormStun;
+                this.immuneTime = c.wormStun + c.wormImmuneAfterStun;
+            }
+
+            tickEffects(dt) {
+                this.stunTime = Math.max(0, this.stunTime - dt);
+                this.slowTime = Math.max(0, this.slowTime - dt);
+                this.boostTime = Math.max(0, this.boostTime - dt);
+                this.immuneTime = Math.max(0, this.immuneTime - dt);
+            }
+
+            // 0 (startovní kategorie) … 1 (max. kategorie), plynule podle rádiusu
             get growthFactor() {
-                const r = CONFIG.worm.radius;
-                return (this.radius - r.start) / (r.max - r.start);
+                const t = CONFIG.worm.tier;
+                const r0 = tierRadius(t.start);
+                const r1 = tierRadius(t.max);
+                return (this.radius - r0) / (r1 - r0);
+            }
+
+            // Kategorie síly pro pravidla (0-based) – skáče po stupních
+            get tier() {
+                return Math.min(tierForRadius(this.radius), CONFIG.worm.tier.max);
+            }
+
+            get isMaxTier() {
+                return this.tier >= CONFIG.worm.tier.max;
+            }
+
+            // Postup k další kategorii 0 … 1 (pro HUD)
+            get tierProgress() {
+                if (this.isMaxTier) return 1;
+                const r0 = tierRadius(this.tier);
+                const r1 = tierRadius(this.tier + 1);
+                return (this.radius - r0) / (r1 - r0);
+            }
+
+            // Změna velikosti o deltaRadius px (záporná = zmenšení); délka těla úměrně
+            grow(deltaRadius) {
+                const cfg = CONFIG.worm;
+                this.radius = Math.min(Math.max(this.radius + deltaRadius, tierRadius(cfg.tier.start)), tierRadius(cfg.tier.max));
+                this.targetLength = cfg.length.start + (cfg.length.max - cfg.length.start) * this.growthFactor;
             }
 
             // px/s
@@ -368,6 +471,10 @@
             // dt: s · input: { left, right } · minX: zadní zeď (levý okraj kamery)
             update(dt, input, minX) {
                 const cfg = CONFIG.worm;
+                this.tickEffects(dt);
+                const stunned = this.isStunned;
+                const prevX = this.x;
+                const prevY = this.y;
 
                 // Vzorkování před hlavou (vějíř −45° … +45° vůči směru pohybu)
                 const s = cfg.sampling;
@@ -399,24 +506,22 @@
                 let currentSpeed;   // px/s
                 if (inRoot) {
                     currentSpeed = this.currentBaseSpeed * cfg.rootSlow;
-                    if (this.radius < cfg.radius.max) {
-                        this.radius += cfg.growth.radius * dt;
-                    }
-                    if (this.targetLength < cfg.length.max) {
-                        this.targetLength += cfg.growth.length * dt;
-                    }
+                    if (!stunned) this.grow(cfg.growth.radius * dt);
                 } else {
                     currentSpeed = this.currentBaseSpeed + (this.currentBoostSpeed - this.currentBaseSpeed) * pathPercentage;
                 }
+                currentSpeed *= this.effectSpeedFactor;
                 this.currentActualSpeed = currentSpeed;
 
                 digTunnel(this.x, this.y, this.radius + cfg.digExtra);
 
+                // Omráčený červ nezatáčí ani se nevlní
                 let isTurning = false;
-                if (input.left)  { this.angle -= cfg.turnRate * dt; isTurning = true; }
-                if (input.right) { this.angle += cfg.turnRate * dt; isTurning = true; }
-
-                this.waveAngle += cfg.wave.freq * dt;
+                if (!stunned) {
+                    if (input.left)  { this.angle -= cfg.turnRate * dt; isTurning = true; }
+                    if (input.right) { this.angle += cfg.turnRate * dt; isTurning = true; }
+                    this.waveAngle += cfg.wave.freq * dt;
+                }
                 const currentAmplitude = isTurning ? cfg.wave.amp * cfg.wave.turnDamp : cfg.wave.amp;
                 this.currentMoveAngle = this.angle + Math.sin(this.waveAngle) * currentAmplitude;
 
@@ -433,7 +538,7 @@
                 // Zadní zeď (levý okraj kamery)
                 if (this.x < minX + this.radius) {
                     this.x = minX + this.radius;
-                    this.angle = Math.PI - this.angle;
+                    if (!stunned) this.angle = Math.PI - this.angle;   // omráčeného jen posune
                 }
 
                 if (this.body.length > 0) {
@@ -441,7 +546,10 @@
                     bounceWormOffStones(this, dt);
                 }
 
-                this.body.push({ x: this.x, y: this.y });
+                // Bod těla jen při pohybu (omráčený červ by jinak hromadil body na místě)
+                if (this.body.length === 0 || this.x !== prevX || this.y !== prevY) {
+                    this.body.push({ x: this.x, y: this.y });
+                }
 
                 // Oříznutí těla na cílovou délku
                 let currentPhysicalLength = 0;
@@ -462,6 +570,11 @@
 
             draw() {
                 const camX = camera.x;
+
+                // Imunita po omráčení: blikání
+                const blinking = this.immuneTime > 0 && !this.isStunned;
+                ctx.globalAlpha = blinking && Math.floor(game.time * 8) % 2 === 0 ? 0.35 : 1;
+
                 for (let i = 0; i < this.body.length; i++) {
                     const segment = this.body[i];
                     ctx.fillStyle = this.color;
@@ -481,6 +594,17 @@
                 ctx.arc(this.x - camX + Math.cos(this.currentMoveAngle - 0.5) * (this.radius * 0.6), this.y + Math.sin(this.currentMoveAngle - 0.5) * (this.radius * 0.6), 2, 0, Math.PI * 2);
                 ctx.arc(this.x - camX + Math.cos(this.currentMoveAngle + 0.5) * (this.radius * 0.6), this.y + Math.sin(this.currentMoveAngle + 0.5) * (this.radius * 0.6), 2, 0, Math.PI * 2);
                 ctx.fill();
+                ctx.globalAlpha = 1;
+
+                // Efekty: zrychlení oranžový, zpomalení modrý obrys hlavy; omráčení hvězdičky
+                if (this.boostTime > 0 || this.slowTime > 0) {
+                    ctx.strokeStyle = this.boostTime > 0 ? '#FFA726' : '#4FC3F7';
+                    ctx.lineWidth = 3;
+                    ctx.beginPath();
+                    ctx.arc(this.x - camX, this.y, this.radius + 3, 0, Math.PI * 2);
+                    ctx.stroke();
+                }
+                if (this.isStunned) drawStunStars(this.x - camX, this.y, this.radius);
             }
         }
 
@@ -532,15 +656,19 @@
                 this.x = x;
                 this.y = y;
 
-                // Velikost roste s postupem mapou
-                const progressRatio = x / WORLD_WIDTH;
-                const minRadius = cfg.radius.min;
-                const adjustedMaxWormRadius = CONFIG.worm.radius.max * cfg.radius.endFactor;
-                const currentMaxPossibleRadius = minRadius + (adjustedMaxWormRadius - minRadius) * progressRatio;
-                this.radius = minRadius + rng() * (currentMaxPossibleRadius - minRadius);
+                // Náhodná velikostní kategorie; s tierByProgress je strop daný postupem mapou
+                // (první pětina mapy jen kat. 1, poslední pětina kat. 1–5)
+                const tierCount = CONFIG.tiers.sizes.length;
+                const unlocked = cfg.tierByProgress
+                    ? Math.max(1, Math.ceil((x / WORLD_WIDTH) * tierCount))
+                    : tierCount;
+                this.tier = Math.min(Math.floor(rng() * unlocked), tierCount - 1);   // 0-based index
+                this.radius = tierRadius(this.tier);
 
                 this.angle = rng() * Math.PI * 2;
-                this.color = '#795548';
+                const look = cfg.tierLooks[this.tier];
+                this.color = look.color;
+                this.eyeColor = look.eye;
                 this.speed = 0;            // px/s (počítá se v update)
 
                 // AI: 'walk' / 'turn' řízené časovačem
@@ -549,6 +677,24 @@
 
                 this.isAwake = false;
                 this.walkCycle = rng() * Math.PI * 2;
+
+                // Stavové efekty ze střetů s červy (s)
+                this.stunTime = 0;
+                this.slowTime = 0;
+                this.clashCooldown = new Map();   // worm → zbývající s
+            }
+
+            get isStunned() {
+                return this.stunTime > 0;
+            }
+
+            tickEffects(dt) {
+                this.stunTime = Math.max(0, this.stunTime - dt);
+                this.slowTime = Math.max(0, this.slowTime - dt);
+                for (const [worm, t] of this.clashCooldown) {
+                    if (t - dt <= 0) this.clashCooldown.delete(worm);
+                    else this.clashCooldown.set(worm, t - dt);
+                }
             }
 
             update(dt, cameraX) {
@@ -560,6 +706,12 @@
                     } else {
                         return;
                     }
+                }
+
+                this.tickEffects(dt);
+                if (this.isStunned) {
+                    this.speed = 0;
+                    return;
                 }
 
                 // Vzorkování před hlavou brouka
@@ -584,6 +736,7 @@
 
                 const pathPercentage = pathHitCount / s.count;
                 this.speed = cfg.speed.dirt + (cfg.speed.tunnel - cfg.speed.dirt) * pathPercentage;
+                if (this.slowTime > 0) this.speed *= CONFIG.clash.slow.factor;
 
                 // AI: když nezatáčí, s danou pravděpodobností za sekundu začne zatáčet
                 if (this.turnTimeLeft <= 0) {
@@ -758,22 +911,32 @@
                 ctx.fill();
 
                 // Oči
-                ctx.fillStyle = 'black';
+                ctx.fillStyle = this.eyeColor;
                 ctx.beginPath();
                 ctx.arc(drawX + Math.cos(this.angle - 0.4) * (this.radius * 0.6), this.y + Math.sin(this.angle - 0.4) * (this.radius * 0.6), this.radius * 0.15, 0, Math.PI * 2);
                 ctx.arc(drawX + Math.cos(this.angle + 0.4) * (this.radius * 0.6), this.y + Math.sin(this.angle + 0.4) * (this.radius * 0.6), this.radius * 0.15, 0, Math.PI * 2);
                 ctx.fill();
+
+                if (this.slowTime > 0) {
+                    ctx.strokeStyle = '#4FC3F7';
+                    ctx.lineWidth = 2;
+                    ctx.beginPath();
+                    ctx.arc(drawX, this.y, this.radius + 3, 0, Math.PI * 2);
+                    ctx.stroke();
+                }
+                if (this.isStunned) drawStunStars(drawX, this.y, this.radius);
             }
         }
 
         // =====================================================================
-        // ===== 6. GAME (reset, step, kamera, pravidla) =======================
+        // ===== 6. GAME (reset, step, kamera, pravidla, střety) ===============
         // =====================================================================
         const camera = { x: 0 };
 
         const game = {
             seed: 0,
             playerCount: 1,
+            time: 0,          // s herního času (animace efektů)
             worms: [],
             bugs: [],
         };
@@ -797,6 +960,7 @@
         function resetGame(seed, playerCount) {
             game.seed = seed;
             game.playerCount = playerCount;
+            game.time = 0;
             camera.x = 0;
 
             const worldRng = mulberry32(seed);
@@ -838,8 +1002,115 @@
             }
         }
 
+        // --- Střety červ ↔ brouk ---------------------------------------------
+
+        // Kontakt brouka s červem: hlava má přednost před tělem.
+        // Vrací { part: 'head' | 'body', x, y, r } (střed a rádius zasaženého kruhu) nebo null.
+        function findContact(worm, bug) {
+            const headDist = Math.hypot(bug.x - worm.x, bug.y - worm.y);
+            if (headDist > worm.targetLength + worm.radius + bug.radius) return null;   // broad-phase
+
+            if (headDist < worm.radius + bug.radius) {
+                return { part: 'head', x: worm.x, y: worm.y, r: worm.radius };
+            }
+
+            // Tělo: bod s nejhlubším průnikem (normála pak míří od těla, ne podél něj)
+            const len = worm.body.length;
+            let best = null;
+            let bestDepth = 0;
+            for (let i = 0; i < len; i++) {
+                const seg = worm.body[i];
+                const segRadius = worm.radius * (0.5 + (i / len) * 0.5);   // jako ve Worm.draw()
+                const depth = segRadius + bug.radius - Math.hypot(bug.x - seg.x, bug.y - seg.y);
+                if (depth > bestDepth) {
+                    bestDepth = depth;
+                    best = { part: 'body', x: seg.x, y: seg.y, r: segRadius };
+                }
+            }
+            return best;
+        }
+
+        // Vysune brouka ven z červa (po normále zasaženého kruhu, opakovaně kvůli sousedním bodům těla)
+        function separateBug(bug, worm, contact) {
+            for (let i = 0; i < 10 && contact; i++) {
+                const dx = bug.x - contact.x;
+                const dy = bug.y - contact.y;
+                const dist = Math.hypot(dx, dy) || 0.0001;
+                const minDist = contact.r + bug.radius + 0.5;
+                bug.x = contact.x + (dx / dist) * minDist;
+                bug.y = contact.y + (dy / dist) * minDist;
+                contact = findContact(worm, bug);
+            }
+        }
+
+        // Pravidla střetu podle kategorií; vrací true, pokud byl brouk sežrán
+        function applyClash(worm, bug, contact) {
+            const c = CONFIG.clash;
+            const diff = worm.tier - bug.tier;   // > 0: červ je větší
+
+            if (contact.part === 'head') {
+                // Červ narazil do brouka
+                if (diff > 0) {
+                    const chance = c.eatGrowChance[Math.min(diff, c.eatGrowChance.length) - 1];
+                    if (Math.random() < chance) worm.grow(bug.radius * c.eatGrowth);
+                    else worm.boostTime = c.boost.duration;
+                    worm.stats.eaten++;
+                    return true;
+                }
+                if (diff === 0) worm.slowTime = c.slow.duration;
+                else worm.stun();
+            } else {
+                // Brouk narazil do těla červa
+                if (diff > 0) {
+                    bug.stunTime = c.bugStun;
+                } else if (diff === 0) {
+                    worm.slowTime = c.slow.duration;
+                    bug.slowTime = c.slow.duration;
+                } else {
+                    worm.grow(-c.bite * (tierRadius(1) - tierRadius(0)));
+                    worm.stun();
+                    worm.stats.bitten++;
+                }
+            }
+            return false;
+        }
+
+        function resolveClashes() {
+            const eaten = new Set();
+
+            for (const worm of game.worms) {
+                for (const bug of game.bugs) {
+                    if (!bug.isAwake || eaten.has(bug) || bug.clashCooldown.has(worm)) continue;
+
+                    const contact = findContact(worm, bug);
+                    if (!contact) continue;
+
+                    // Omráčený brouk do těla nenaráží
+                    if (contact.part === 'body' && bug.isStunned) continue;
+
+                    // Imunní červ může jen žrát; ostatní střety jen odsunou brouka
+                    const isEat = contact.part === 'head' && worm.tier > bug.tier;
+                    if (worm.immuneTime > 0 && !isEat) {
+                        separateBug(bug, worm, contact);
+                        continue;
+                    }
+
+                    if (applyClash(worm, bug, contact)) {
+                        eaten.add(bug);
+                    } else {
+                        separateBug(bug, worm, contact);
+                        bug.clashCooldown.set(worm, CONFIG.clash.pairCooldown);
+                    }
+                }
+            }
+
+            if (eaten.size > 0) game.bugs = game.bugs.filter(b => !eaten.has(b));
+        }
+
         // Jeden simulační krok (dt v sekundách)
         function step(dt) {
+            game.time += dt;
+
             game.worms.forEach((worm, i) => {
                 const input = readInput(getControlsFor(i, game.playerCount));
                 worm.update(dt, input, camera.x);
@@ -850,6 +1121,8 @@
             for (let i = 0; i < game.bugs.length; i++) {
                 game.bugs[i].update(dt, camera.x);
             }
+
+            resolveClashes();
         }
 
         // =====================================================================
@@ -903,19 +1176,40 @@
             }
         }
 
+        // Omráčení: 3 žluté tečky kroužící nad hlavou (x je už v souřadnicích obrazovky)
+        function drawStunStars(x, y, radius) {
+            ctx.fillStyle = '#FFEB3B';
+            const orbit = radius + 6;
+            for (let i = 0; i < 3; i++) {
+                const a = game.time * 6 + i * (Math.PI * 2 / 3);
+                ctx.beginPath();
+                ctx.arc(x + Math.cos(a) * orbit, y - radius * 0.5 + Math.sin(a) * orbit * 0.4, 3, 0, Math.PI * 2);
+                ctx.fill();
+            }
+        }
+
+        function wormEffectText(w) {
+            if (w.isStunned) return ` · OMRÁČEN ${w.stunTime.toFixed(1)} s`;
+            const parts = [];
+            if (w.boostTime > 0) parts.push('ZRYCHLENÍ');
+            if (w.slowTime > 0) parts.push('ZPOMALENÍ');
+            return parts.length ? ' · ' + parts.join(' + ') : '';
+        }
+
         function drawHud() {
             ctx.font = '16px Arial';
             ctx.fillStyle = 'white';
             ctx.textAlign = 'left';
             game.worms.forEach((w, i) => {
+                const progressText = w.isMaxTier ? 'MAX' : `${Math.floor(w.tierProgress * 100)} % k další`;
                 ctx.fillText(
-                    `P${i + 1} · Rádius: ${Math.round(w.radius)} | Rychlost: ${w.currentActualSpeed.toFixed(0)} / ${w.currentBoostSpeed.toFixed(0)} px/s`,
+                    `P${i + 1} · Kat. ${w.tier + 1} (${progressText}) · Rádius: ${Math.round(w.radius)} | Rychlost: ${w.currentActualSpeed.toFixed(0)} / ${w.currentBoostSpeed.toFixed(0)} px/s · Sežráno: ${w.stats.eaten} · Ukousnuto: ${w.stats.bitten}${wormEffectText(w)}`,
                     20, 30 + i * 22
                 );
             });
 
             ctx.textAlign = 'right';
-            ctx.fillText(`Seed: ${game.seed} · Hráči: ${game.playerCount} · [R] restart · [N] nová mapa · [1/2] hráči`, canvas.width - 20, 30);
+            ctx.fillText(`Seed: ${game.seed} · Hráči: ${game.playerCount} · [R] restart · [N] nová mapa · [1/2] hráči`, canvas.width - 20, canvas.height - 15);   // dole – nahoře je dlouhý řádek hráče
             ctx.textAlign = 'left';
         }
 
