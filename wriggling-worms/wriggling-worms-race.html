@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Worm Prototype - Fáze 6</title>
+    <title>Worm Prototype - Fáze 7</title>
     <style>
         body {
             background-color: #1e1e1e;
@@ -48,7 +48,7 @@
 <body>
 
     <div id="game-container">
-        <h1>Worm Proto - Fáze 6 (Brouci: velikostní kategorie a střety)</h1>
+        <h1>Worm Proto - Fáze 7 (Cíl: mrkev, časomíra)</h1>
         <canvas id="gameCanvas" width="1600" height="900"></canvas>
         <div class="controls">
             Hráč 1: <b>Šipky VLEVO / VPRAVO</b> · Hráč 2: <b>A / D</b> (v režimu 1 hráče fungují obě) ·
@@ -131,6 +131,13 @@
                 bite: 0.5,                                   // zmenšení = 0.5 × krok kategorie (6,25 px)
                 pairCooldown: 1,                             // s – dvojice červ–brouk po střetu
                 wormImmuneAfterStun: 1,                      // s – po omráčení (proti stun-locku)
+            },
+            // Cíl: zakousnutí hlavy do mrkve na konci mapy ukončí závod.
+            finish: {
+                countdown: 3,                                // s – odpočet před startem, vše stojí
+                carrot: { x: 15800, rx: 18, ry: 55, marginY: 90, attempts: 20 },  // svislá elipsa (hitbox), výška náhodná podle seedu
+                stoneClearance: 20,                          // px – mrkev se nekryje s kamenem
+                confetti: 120,
             },
             stones: { count: 500, maxAreaRatio: 0.20, rx: [15, 45], ry: [10, 30], safeRadius: 150, maxAttempts: 10 },
             roots:  { systems: 60, marginX: 400, radius: [20, 40], segments: [20, 50], shrink: 0.90, minRadius: 3, stepY: 0.8 },
@@ -332,6 +339,39 @@
                 const x = cfg.spawnMinX + rng() * (WORLD_WIDTH - cfg.spawnMinX);
                 const y = rng() * WORLD_HEIGHT;
                 game.bugs.push(new Bug(x, y, rng));
+            }
+        }
+
+        // Mrkev na náhodné výšce; generuje se až po broucích, aby se ostatní mapa pro seed nezměnila
+        const carrot = { x: 0, y: 0, rx: 0, ry: 0, bite: null };
+
+        function initCarrot(rng) {
+            const cfg = CONFIG.finish.carrot;
+            const clearance = CONFIG.finish.stoneClearance;
+            carrot.x = cfg.x;
+            carrot.rx = cfg.rx;
+            carrot.ry = cfg.ry;
+            carrot.bite = null;
+
+            // Mrkev ≈ svislá úsečka s tloušťkou rx; kámen ≈ kruh s rádiusem max(rx, ry)
+            const blocksCarrot = (s) => {
+                const nearestY = Math.max(carrot.y - cfg.ry, Math.min(carrot.y + cfg.ry, s.y));
+                return Math.hypot(s.x - carrot.x, s.y - nearestY) < Math.max(s.rx, s.ry) + cfg.rx + clearance;
+            };
+            for (let i = 0; i < cfg.attempts; i++) {
+                carrot.y = cfg.marginY + rng() * (WORLD_HEIGHT - cfg.marginY * 2);
+                if (!stones.some(blocksCarrot)) return;
+            }
+
+            // Volné místo se nenašlo (hustě kamenitý konec mapy) → kameny u mrkve odstranit i se stopou
+            tCtx.fillStyle = CONFIG.colors.dirt;
+            for (let i = stones.length - 1; i >= 0; i--) {
+                const s = stones[i];
+                if (!blocksCarrot(s)) continue;
+                tCtx.beginPath();
+                tCtx.ellipse(s.x, s.y, s.rx + 1, s.ry + 1, s.rotation, 0, Math.PI * 2);
+                tCtx.fill();
+                stones.splice(i, 1);
             }
         }
 
@@ -936,7 +976,12 @@
         const game = {
             seed: 0,
             playerCount: 1,
-            time: 0,          // s herního času (animace efektů)
+            time: 0,          // s – hodiny animací (běží vždy)
+            phase: 'countdown',   // 'countdown' | 'race' | 'finished'
+            countdown: 0,     // s do startu
+            raceTime: 0,      // s od startu
+            result: null,     // { winner, time, best, isRecord } po dojetí
+            confetti: [],
             worms: [],
             bugs: [],
         };
@@ -961,6 +1006,11 @@
             game.seed = seed;
             game.playerCount = playerCount;
             game.time = 0;
+            game.phase = 'countdown';
+            game.countdown = CONFIG.finish.countdown;
+            game.raceTime = 0;
+            game.result = null;
+            game.confetti = [];
             camera.x = 0;
 
             const worldRng = mulberry32(seed);
@@ -971,6 +1021,7 @@
             initStones(worldRng, getAllStartPositions());
             initRoots(worldRng);
             initBugs(worldRng);
+            initCarrot(worldRng);
 
             syncUrl();
         }
@@ -998,7 +1049,7 @@
             const triggerX = CONFIG.view.width * CONFIG.view.cameraTrigger;
             const leaderX = Math.max(...worms.map(w => w.x));
             if (leaderX - camera.x > triggerX) {
-                camera.x = leaderX - triggerX;
+                camera.x = Math.min(leaderX - triggerX, WORLD_WIDTH - CONFIG.view.width);   // konec mapy
             }
         }
 
@@ -1107,9 +1158,105 @@
             if (eaten.size > 0) game.bugs = game.bugs.filter(b => !eaten.has(b));
         }
 
+        // --- Cíl, časomíra, rekord -------------------------------------------
+
+        // Hlava se dotkne elipsy mrkve (normalizovaný test jako u kamenů)
+        function touchesCarrot(worm) {
+            const nx = (worm.x - carrot.x) / (carrot.rx + worm.radius);
+            const ny = (worm.y - carrot.y) / (carrot.ry + worm.radius);
+            return nx * nx + ny * ny <= 1;
+        }
+
+        function checkFinish() {
+            const winner = game.worms.findIndex(touchesCarrot);   // při současném dojetí vyhrává nižší index
+            if (winner !== -1) finishRace(winner);
+        }
+
+        function bestTimeKey() {
+            return `wormRace.best.${game.seed}.${game.playerCount}`;
+        }
+
+        function loadBestTime() {
+            try {
+                const value = parseFloat(localStorage.getItem(bestTimeKey()));
+                return Number.isFinite(value) ? value : null;
+            } catch (e) {
+                return null;   // bez úložiště (file:// v některých prohlížečích) se rekord nevede
+            }
+        }
+
+        function saveBestTime(time) {
+            try {
+                localStorage.setItem(bestTimeKey(), String(time));
+                return true;
+            } catch (e) {
+                return false;
+            }
+        }
+
+        function finishRace(winner) {
+            const worm = game.worms[winner];
+            const time = game.raceTime;
+            const previousBest = loadBestTime();
+            const isRecord = (previousBest === null || time < previousBest) && saveBestTime(time);
+
+            game.phase = 'finished';
+            game.result = { winner, time, best: isRecord ? time : previousBest, isRecord };
+
+            // Ukousnutí: místo zásahu na okraji mrkve směrem k hlavě
+            const angle = Math.atan2(worm.y - carrot.y, worm.x - carrot.x);
+            carrot.bite = { x: carrot.x + Math.cos(angle) * carrot.rx, y: carrot.y + Math.sin(angle) * carrot.ry, r: worm.radius };
+
+            spawnConfetti();
+        }
+
+        // Konfety padají z horní části obrazovky (souřadnice obrazovky)
+        function spawnConfetti() {
+            const colors = ['#FF7043', '#FFCA28', '#66BB6A', '#42A5F5', '#AB47BC', '#EC407A'];
+            game.confetti = [];
+            for (let i = 0; i < CONFIG.finish.confetti; i++) {
+                game.confetti.push({
+                    x: Math.random() * CONFIG.view.width,
+                    y: -Math.random() * CONFIG.view.height * 0.6,
+                    vx: (Math.random() - 0.5) * 80,
+                    vy: 120 + Math.random() * 160,
+                    angle: Math.random() * Math.PI * 2,
+                    spin: (Math.random() - 0.5) * 10,
+                    color: colors[i % colors.length],
+                });
+            }
+        }
+
+        function updateConfetti(dt) {
+            for (const c of game.confetti) {
+                c.x += c.vx * dt;
+                c.y += c.vy * dt;
+                c.angle += c.spin * dt;
+                if (c.y > CONFIG.view.height + 10) c.y -= CONFIG.view.height + 20;   // dokola
+            }
+        }
+
+        function formatTime(seconds) {
+            const minutes = Math.floor(seconds / 60);
+            const rest = seconds - minutes * 60;
+            return `${minutes}:${rest.toFixed(2).padStart(5, '0')}`;
+        }
+
         // Jeden simulační krok (dt v sekundách)
         function step(dt) {
             game.time += dt;
+
+            if (game.phase === 'countdown') {
+                game.countdown -= dt;
+                if (game.countdown <= 0) game.phase = 'race';
+                return;
+            }
+            if (game.phase === 'finished') {
+                updateConfetti(dt);
+                return;
+            }
+
+            game.raceTime += dt;
 
             game.worms.forEach((worm, i) => {
                 const input = readInput(getControlsFor(i, game.playerCount));
@@ -1123,6 +1270,7 @@
             }
 
             resolveClashes();
+            checkFinish();
         }
 
         // =====================================================================
@@ -1176,6 +1324,53 @@
             }
         }
 
+        // Mrkev: oranžové tělo špičkou dolů, rýhy, zelená nať nahoře; po dojetí ukousnutá
+        function drawCarrot() {
+            const x = carrot.x - camera.x;
+            const { y, rx, ry } = carrot;
+            if (x + rx + 20 < 0 || x - rx - 20 > canvas.width) return;
+
+            const topY = y - ry;
+
+            // Nať
+            ctx.fillStyle = '#43A047';
+            for (let i = -1; i <= 1; i++) {
+                ctx.beginPath();
+                ctx.ellipse(x + i * rx * 0.45, topY - 14, 5, 16, i * 0.35, 0, Math.PI * 2);
+                ctx.fill();
+            }
+
+            // Tělo
+            ctx.beginPath();
+            ctx.moveTo(x - rx, topY + 6);
+            ctx.quadraticCurveTo(x - rx * 0.8, y + ry * 0.3, x, y + ry);
+            ctx.quadraticCurveTo(x + rx * 0.8, y + ry * 0.3, x + rx, topY + 6);
+            ctx.quadraticCurveTo(x, topY - 6, x - rx, topY + 6);
+            ctx.fillStyle = '#F57C00';
+            ctx.fill();
+            ctx.lineWidth = 2;
+            ctx.strokeStyle = '#BF360C';
+            ctx.stroke();
+
+            // Rýhy
+            ctx.strokeStyle = 'rgba(191, 54, 12, 0.7)';
+            for (let i = 1; i <= 4; i++) {
+                const ly = topY + (ry * 2) * (i / 5);
+                const halfWidth = rx * (1 - i / 5) * 0.6;
+                ctx.beginPath();
+                ctx.moveTo(x - halfWidth, ly);
+                ctx.lineTo(x - halfWidth * 0.2, ly + 2);
+                ctx.stroke();
+            }
+
+            if (carrot.bite) {
+                ctx.fillStyle = CONFIG.colors.path;
+                ctx.beginPath();
+                ctx.arc(carrot.bite.x - camera.x, carrot.bite.y, carrot.bite.r * 0.8, 0, Math.PI * 2);
+                ctx.fill();
+            }
+        }
+
         // Omráčení: 3 žluté tečky kroužící nad hlavou (x je už v souřadnicích obrazovky)
         function drawStunStars(x, y, radius) {
             ctx.fillStyle = '#FFEB3B';
@@ -1210,6 +1405,94 @@
 
             ctx.textAlign = 'right';
             ctx.fillText(`Seed: ${game.seed} · Hráči: ${game.playerCount} · [R] restart · [N] nová mapa · [1/2] hráči`, canvas.width - 20, canvas.height - 15);   // dole – nahoře je dlouhý řádek hráče
+
+            // Čas – vpravo nahoře (vlevo je řádek hráče)
+            ctx.font = 'bold 32px Arial';
+            ctx.fillText(formatTime(game.raceTime), canvas.width - 20, 40);
+            ctx.textAlign = 'left';
+
+            drawCountdown();
+        }
+
+        // Odpočet 3-2-1 a krátce po startu „START!“
+        function drawCountdown() {
+            let text = null;
+            if (game.phase === 'countdown') text = String(Math.ceil(game.countdown));
+            else if (game.phase === 'race' && game.raceTime < 0.7) text = 'START!';
+            if (!text) return;
+
+            ctx.font = 'bold 120px Arial';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.lineWidth = 8;
+            ctx.strokeStyle = 'rgba(0, 0, 0, 0.6)';
+            ctx.strokeText(text, canvas.width / 2, canvas.height / 2);
+            ctx.fillStyle = text === 'START!' ? '#66BB6A' : '#FFCA28';
+            ctx.fillText(text, canvas.width / 2, canvas.height / 2);
+            ctx.textAlign = 'left';
+            ctx.textBaseline = 'alphabetic';
+        }
+
+        // Oslavná zpráva: vítěz, čas, rekord, statistiky + konfety
+        function drawFinishOverlay() {
+            const result = game.result;
+            if (!result) return;
+
+            ctx.fillStyle = 'rgba(0, 0, 0, 0.45)';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            for (const c of game.confetti) {
+                ctx.save();
+                ctx.translate(c.x, c.y);
+                ctx.rotate(c.angle);
+                ctx.fillStyle = c.color;
+                ctx.fillRect(-5, -3, 10, 6);
+                ctx.restore();
+            }
+
+            const panelWidth = 640;
+            const panelHeight = 300 + game.worms.length * 30;
+            const px = (canvas.width - panelWidth) / 2;
+            const py = (canvas.height - panelHeight) / 2;
+            const cx = canvas.width / 2;
+
+            ctx.fillStyle = 'rgba(30, 20, 15, 0.92)';
+            ctx.fillRect(px, py, panelWidth, panelHeight);
+            ctx.lineWidth = 4;
+            ctx.strokeStyle = '#F57C00';
+            ctx.strokeRect(px, py, panelWidth, panelHeight);
+
+            ctx.textAlign = 'center';
+            const winnerColors = PLAYER_COLORS[result.winner];
+            ctx.font = 'bold 56px Arial';
+            ctx.fillStyle = game.playerCount === 1 ? '#FFCA28' : winnerColors.head;
+            ctx.lineWidth = 3;
+            ctx.strokeStyle = 'rgba(255, 255, 255, 0.85)';
+            const title = game.playerCount === 1 ? 'CÍL! Mrkev je tvoje!' : `Hráč ${result.winner + 1} vyhrává!`;
+            if (game.playerCount > 1) ctx.strokeText(title, cx, py + 75);
+            ctx.fillText(title, cx, py + 75);
+
+            ctx.font = 'bold 44px Arial';
+            ctx.fillStyle = 'white';
+            ctx.fillText(formatTime(result.time), cx, py + 140);
+
+            ctx.font = 'bold 22px Arial';
+            if (result.isRecord) {
+                ctx.fillStyle = '#FFCA28';
+                ctx.fillText('NOVÝ REKORD!', cx, py + 180);
+            } else if (result.best !== null) {
+                ctx.fillStyle = '#BDBDBD';
+                ctx.fillText(`Rekord: ${formatTime(result.best)}`, cx, py + 180);
+            }
+
+            ctx.font = '18px Arial';
+            game.worms.forEach((w, i) => {
+                ctx.fillStyle = game.playerCount === 1 ? 'white' : (i === result.winner ? '#FFCA28' : '#BDBDBD');
+                ctx.fillText(`P${i + 1} · Kat. ${w.tier + 1} · Sežráno: ${w.stats.eaten} · Ukousnuto: ${w.stats.bitten}`, cx, py + 225 + i * 30);
+            });
+
+            ctx.fillStyle = '#9E9E9E';
+            ctx.fillText(`[R] znovu stejná mapa · [N] nová mapa · Seed ${game.seed}`, cx, py + panelHeight - 30);
             ctx.textAlign = 'left';
         }
 
@@ -1222,6 +1505,7 @@
 
             drawRootsOverlay();
             drawStones();
+            drawCarrot();
 
             for (let i = 0; i < game.bugs.length; i++) {
                 game.bugs[i].draw();
@@ -1231,6 +1515,7 @@
             }
 
             drawHud();
+            if (game.phase === 'finished') drawFinishOverlay();
         }
 
         // =====================================================================
