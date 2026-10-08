@@ -1,0 +1,980 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Worm Prototype - Fáze 5 (refaktoring A)</title>
+    <style>
+        body {
+            background-color: #1e1e1e;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+            overflow: hidden;
+            color: #d4d4d4;
+            font-family: sans-serif;
+        }
+        #game-container {
+            position: relative;
+        }
+        h1 {
+            margin: 0 0 1rem;
+            font-size: 1.5rem;
+            line-height: 2rem;
+            font-weight: 700;
+            color: #fb923c;
+        }
+        canvas {
+            border: 2px solid #555;
+            background-color: #2b2b2b;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+            max-width: 95vw;
+            max-height: 80vh;
+            display: block;
+        }
+        .controls {
+            position: absolute;
+            bottom: -50px;
+            left: 0;
+            right: 0;
+            text-align: center;
+            font-size: 14px;
+            color: #888;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="game-container">
+        <h1>Worm Proto - Fáze 5 (NPC Brouci) · refaktoring A</h1>
+        <canvas id="gameCanvas" width="1600" height="900"></canvas>
+        <div class="controls">
+            Hráč 1: <b>Šipky VLEVO / VPRAVO</b> · Hráč 2: <b>A / D</b> (v režimu 1 hráče fungují obě) ·
+            <b>R</b> restart · <b>N</b> nová mapa · <b>1 / 2</b> počet hráčů · URL: <code>?seed=123&amp;players=2</code>
+        </div>
+    </div>
+
+    <script>
+        // =====================================================================
+        // ===== 1. CONFIG =====================================================
+        // =====================================================================
+        // Všechny rychlosti, tempa a růst jsou v jednotkách ZA SEKUNDU.
+        // Simulace běží s fixním krokem 60 Hz, takže hodnoty odpovídají
+        // původním hodnotám "za frame" × 60 (Fáze 5 se chová stejně).
+        const CONFIG = {
+            sim:   { hz: 60, maxFrameTime: 0.25 },          // maxFrameTime: ochrana po přepnutí záložky (s)
+            view:  { width: 1600, height: 900, cameraTrigger: 0.75 },
+            world: { width: 16000, height: 900 },
+            colors: {
+                dirt: '#3E2723',          // nevykopáno
+                path: '#D7CCC8',          // vykopaná cesta
+                root: '#8D6E63',          // kořeny
+                stoneTerrain: '#261714',  // stopa kamene v terénu
+            },
+            players: { count: 1, startX: 100, spacingY: 240 },
+            worm: {
+                radius: { start: 9, max: 25 },
+                length: { start: 75, max: 300 },
+                speed:  { dirt: 101.25, tunnel: 168.75 },  // px/s  (1.6875 / 2.8125 px/frame)
+                sizeSpeedBonus: 0.5,                         // na max. velikosti ×1.5
+                rootSlow: 0.25,                              // rychlost v kořeni = 25 % základní
+                turnRate: 3,                                 // rad/s (0.05 rad/frame)
+                wave: { freq: 12, amp: 0.15, turnDamp: 0.2 },// freq rad/s (0.2/frame)
+                growth: { radius: 1.6875, length: 16.875 },  // px/s při žraní kořene → max za ≈ 9,5 s
+                digExtra: 2,                                 // tunel = radius + 2
+                sampling: { count: 5, spread: Math.PI / 4, ahead: 5 },
+                neckProtection: 3.5,                         // × radius
+                selfHitDist: 1.8,                            // × radius
+            },
+            bug: {
+                count: 30,
+                spawnMinX: 500,
+                radius: { min: 4.5, endFactor: 1.25 },      // na konci mapy až 125 % max. rádiusu červa
+                speed:  { dirt: 100.8, tunnel: 168 },        // px/s  (1.68 / 2.8 px/frame)
+                wakeDistance: 300,                           // px za pravým okrajem obrazovky
+                turn: {
+                    chancePerSec: 3.08,                      // ≈ 5 %/frame při 60 Hz  (−ln(0.95)·60)
+                    duration: [1 / 3, 4 / 3],                // s  (20–80 framů)
+                    maxRate: 3,                              // rad/s (±0.05 rad/frame)
+                },
+                walkAnim: 15,                                // rad/s (0.25/frame)
+                digExtra: 1,
+                sampling: { count: 3, spread: Math.PI / 4, ahead: 5 },
+            },
+            stones: { count: 500, maxAreaRatio: 0.20, rx: [15, 45], ry: [10, 30], safeRadius: 150, maxAttempts: 10 },
+            roots:  { systems: 60, marginX: 400, radius: [20, 40], segments: [20, 50], shrink: 0.90, minRadius: 3, stepY: 0.8 },
+        };
+
+        const WORLD_WIDTH = CONFIG.world.width;
+        const WORLD_HEIGHT = CONFIG.world.height;
+
+        const PLAYER_COLORS = [
+            { head: '#6d1818', body: '#380608' },   // hráč 1 – červený
+            { head: '#1b4f72', body: '#0b2236' },   // hráč 2 – modrý
+        ];
+
+        // =====================================================================
+        // ===== 2. UTIL (rng, math) ===========================================
+        // =====================================================================
+        // Seedovaný PRNG – stejný seed = stejná mapa.
+        function mulberry32(seed) {
+            let a = seed >>> 0;
+            return function () {
+                a = (a + 0x6D2B79F5) | 0;
+                let t = Math.imul(a ^ (a >>> 15), 1 | a);
+                t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+                return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+            };
+        }
+
+        function randRange(rng, range) {
+            return range[0] + rng() * (range[1] - range[0]);
+        }
+
+        function newRandomSeed() {
+            return Math.floor(Math.random() * 1e9) + 1;
+        }
+
+        // =====================================================================
+        // ===== 3. INPUT ======================================================
+        // =====================================================================
+        // e.code = fyzická klávesa (nezávislé na CZ rozložení a CapsLocku).
+        const CONTROLS = [
+            { left: ['ArrowLeft'], right: ['ArrowRight'] },   // hráč 1
+            { left: ['KeyA'],      right: ['KeyD'] },         // hráč 2
+        ];
+        const SOLO_CONTROLS = { left: ['ArrowLeft', 'KeyA'], right: ['ArrowRight', 'KeyD'] };
+
+        const pressedKeys = new Set();
+
+        window.addEventListener('keydown', (e) => {
+            if (e.code.startsWith('Arrow')) e.preventDefault();
+            if (!e.repeat) handleActionKey(e.code);
+            pressedKeys.add(e.code);
+        });
+        window.addEventListener('keyup', (e) => pressedKeys.delete(e.code));
+        window.addEventListener('blur', () => pressedKeys.clear());
+
+        function readInput(map) {
+            return {
+                left:  map.left.some(k => pressedKeys.has(k)),
+                right: map.right.some(k => pressedKeys.has(k)),
+            };
+        }
+
+        function getControlsFor(playerIndex, playerCount) {
+            return playerCount === 1 ? SOLO_CONTROLS : CONTROLS[playerIndex];
+        }
+
+        // =====================================================================
+        // ===== 4. WORLD (terén, kameny, kořeny, generování) ==================
+        // =====================================================================
+        const canvas = document.getElementById('gameCanvas');
+        canvas.width = CONFIG.view.width;
+        canvas.height = CONFIG.view.height;
+        const ctx = canvas.getContext('2d');
+
+        // Offscreen canvas pro uchování "vykopaného" terénu pro celý svět
+        const terrainCanvas = document.createElement('canvas');
+        terrainCanvas.width = WORLD_WIDTH;
+        terrainCanvas.height = WORLD_HEIGHT;
+        const tCtx = terrainCanvas.getContext('2d', { willReadFrequently: true });
+
+        const stones = [];
+        const rootsData = [];
+
+        function clearTerrain() {
+            tCtx.fillStyle = CONFIG.colors.dirt;
+            tCtx.fillRect(0, 0, WORLD_WIDTH, WORLD_HEIGHT);
+        }
+
+        function isPathColor(r, g, b) {
+            return (r > 200 && g > 190 && b > 190);
+        }
+
+        function isRootColor(r, g, b) {
+            return (r > 120 && r < 160 && g > 90 && g < 130 && b > 80 && b < 120);
+        }
+
+        function digTunnel(x, y, radius) {
+            tCtx.fillStyle = CONFIG.colors.path;
+            tCtx.beginPath();
+            tCtx.arc(x, y, radius, 0, Math.PI * 2);
+            tCtx.fill();
+        }
+
+        // safePoints: body, kolem kterých se nesmí generovat kameny (starty hráčů)
+        function initStones(rng, safePoints) {
+            const cfg = CONFIG.stones;
+            stones.length = 0;
+            const maxTotalArea = WORLD_WIDTH * WORLD_HEIGHT * cfg.maxAreaRatio;
+            let currentTotalArea = 0;
+
+            for (let i = 0; i < cfg.count; i++) {
+                const rx = randRange(rng, cfg.rx);
+                const ry = randRange(rng, cfg.ry);
+                const stoneArea = Math.PI * rx * ry;
+
+                if (currentTotalArea + stoneArea > maxTotalArea) break;
+
+                const rotation = rng() * Math.PI * 2;
+
+                let x, y;
+                let attempts = 0;
+                let validPosition = false;
+
+                do {
+                    x = rng() * (WORLD_WIDTH - rx * 2) + rx;
+                    y = rng() * (WORLD_HEIGHT - ry * 2) + ry;
+                    attempts++;
+                    validPosition = safePoints.every(p => Math.hypot(x - p.x, y - p.y) > cfg.safeRadius);
+                } while (!validPosition && attempts < cfg.maxAttempts);
+
+                if (validPosition) {
+                    stones.push({ x, y, rx, ry, rotation });
+                    currentTotalArea += stoneArea;
+
+                    tCtx.fillStyle = CONFIG.colors.stoneTerrain;
+                    tCtx.beginPath();
+                    tCtx.ellipse(x, y, rx, ry, rotation, 0, Math.PI * 2);
+                    tCtx.fill();
+                }
+            }
+        }
+
+        function initRoots(rng) {
+            const cfg = CONFIG.roots;
+            rootsData.length = 0;
+            tCtx.fillStyle = CONFIG.colors.root;
+
+            for (let r = 0; r < cfg.systems; r++) {
+                const isBottomRoot = rng() > 0.5;
+
+                const startX = cfg.marginX + rng() * (WORLD_WIDTH - cfg.marginX * 2);
+                const startY = isBottomRoot ? WORLD_HEIGHT : 0;
+
+                let currentX = startX;
+                let currentY = startY;
+                let currentRadius = randRange(rng, cfg.radius);
+
+                const segmentsCount = randRange(rng, cfg.segments);
+                const rootSegments = [];
+
+                for (let s = 0; s < segmentsCount; s++) {
+                    tCtx.beginPath();
+                    tCtx.arc(currentX, currentY, currentRadius, 0, Math.PI * 2);
+                    tCtx.fill();
+
+                    rootSegments.push({ x: currentX, y: currentY, radius: currentRadius });
+
+                    const yDirection = isBottomRoot ? -1 : 1;
+                    currentY += (currentRadius * cfg.stepY) * yDirection;
+                    currentX += (rng() - 0.5) * currentRadius * 2;
+
+                    currentRadius *= cfg.shrink;
+
+                    if (currentRadius < cfg.minRadius) break;
+                }
+                rootsData.push(rootSegments);
+            }
+        }
+
+        function initBugs(rng) {
+            const cfg = CONFIG.bug;
+            game.bugs.length = 0;
+            for (let i = 0; i < cfg.count; i++) {
+                const x = cfg.spawnMinX + rng() * (WORLD_WIDTH - cfg.spawnMinX);
+                const y = rng() * WORLD_HEIGHT;
+                game.bugs.push(new Bug(x, y, rng));
+            }
+        }
+
+        // =====================================================================
+        // ===== 5. ENTITIES (Worm, Bug) =======================================
+        // =====================================================================
+        class Worm {
+            constructor(x, y, colors) {
+                const cfg = CONFIG.worm;
+                this.x = x;
+                this.y = y;
+
+                this.radius = cfg.radius.start;
+                this.targetLength = cfg.length.start;
+
+                this.angle = 0;
+                this.waveAngle = 0;
+                this.currentMoveAngle = this.angle;
+
+                this.headColor = colors.head;
+                this.color = colors.body;
+
+                this.body = [];
+                this.currentActualSpeed = 0;   // px/s – pro HUD
+            }
+
+            get growthFactor() {
+                const r = CONFIG.worm.radius;
+                return (this.radius - r.start) / (r.max - r.start);
+            }
+
+            // px/s
+            get currentBaseSpeed() {
+                return CONFIG.worm.speed.dirt * (1 + this.growthFactor * CONFIG.worm.sizeSpeedBonus);
+            }
+
+            // px/s
+            get currentBoostSpeed() {
+                return CONFIG.worm.speed.tunnel * (1 + this.growthFactor * CONFIG.worm.sizeSpeedBonus);
+            }
+
+            checkBodyCollision() {
+                const cfg = CONFIG.worm;
+                const neckProtectionDist = this.radius * cfg.neckProtection;
+                let currentBodyDist = 0;
+                let collidedBodyPoint = null;
+
+                for (let i = this.body.length - 1; i >= 0; i--) {
+                    const segment = this.body[i];
+
+                    if (i < this.body.length - 1) {
+                        const prevSegment = this.body[i + 1];
+                        currentBodyDist += Math.hypot(segment.x - prevSegment.x, segment.y - prevSegment.y);
+                    }
+
+                    if (currentBodyDist > neckProtectionDist) {
+                        const distToHead = Math.hypot(this.x - segment.x, this.y - segment.y);
+                        if (distToHead < this.radius * cfg.selfHitDist) {
+                            collidedBodyPoint = segment;
+                            break;
+                        }
+                    }
+                }
+
+                if (collidedBodyPoint) {
+                    const nx = this.x - collidedBodyPoint.x;
+                    const ny = this.y - collidedBodyPoint.y;
+
+                    const collisionAngle = Math.atan2(ny, nx);
+                    this.angle = collisionAngle;
+                    this.currentMoveAngle = this.angle;
+
+                    this.x += Math.cos(this.angle) * this.radius;
+                    this.y += Math.sin(this.angle) * this.radius;
+                }
+            }
+
+            // dt: s · input: { left, right } · minX: zadní zeď (levý okraj kamery)
+            update(dt, input, minX) {
+                const cfg = CONFIG.worm;
+
+                // Vzorkování před hlavou (vějíř −45° … +45° vůči směru pohybu)
+                const s = cfg.sampling;
+                const lookAheadDist = this.radius + s.ahead;
+                let pathHitCount = 0;
+                let inRoot = false;
+
+                for (let i = 0; i < s.count; i++) {
+                    const sampleAngleOffset = -s.spread + (s.spread * 2 * (i / (s.count - 1 || 1)));
+                    const sampleAngle = this.currentMoveAngle + sampleAngleOffset;
+
+                    const checkX = this.x + Math.cos(sampleAngle) * lookAheadDist;
+                    const checkY = this.y + Math.sin(sampleAngle) * lookAheadDist;
+
+                    if (checkX >= 0 && checkX < WORLD_WIDTH && checkY >= 0 && checkY < WORLD_HEIGHT) {
+                        const pixel = tCtx.getImageData(checkX, checkY, 1, 1).data;
+                        if (isPathColor(pixel[0], pixel[1], pixel[2])) {
+                            pathHitCount++;
+                        }
+                        if (i === Math.floor(s.count / 2) && isRootColor(pixel[0], pixel[1], pixel[2])) {
+                            inRoot = true;
+                        }
+                    }
+                }
+
+                // 0.0 (hlína) až 1.0 (čistá cesta)
+                const pathPercentage = pathHitCount / s.count;
+
+                let currentSpeed;   // px/s
+                if (inRoot) {
+                    currentSpeed = this.currentBaseSpeed * cfg.rootSlow;
+                    if (this.radius < cfg.radius.max) {
+                        this.radius += cfg.growth.radius * dt;
+                    }
+                    if (this.targetLength < cfg.length.max) {
+                        this.targetLength += cfg.growth.length * dt;
+                    }
+                } else {
+                    currentSpeed = this.currentBaseSpeed + (this.currentBoostSpeed - this.currentBaseSpeed) * pathPercentage;
+                }
+                this.currentActualSpeed = currentSpeed;
+
+                digTunnel(this.x, this.y, this.radius + cfg.digExtra);
+
+                let isTurning = false;
+                if (input.left)  { this.angle -= cfg.turnRate * dt; isTurning = true; }
+                if (input.right) { this.angle += cfg.turnRate * dt; isTurning = true; }
+
+                this.waveAngle += cfg.wave.freq * dt;
+                const currentAmplitude = isTurning ? cfg.wave.amp * cfg.wave.turnDamp : cfg.wave.amp;
+                this.currentMoveAngle = this.angle + Math.sin(this.waveAngle) * currentAmplitude;
+
+                this.x += Math.cos(this.currentMoveAngle) * currentSpeed * dt;
+                this.y += Math.sin(this.currentMoveAngle) * currentSpeed * dt;
+
+                if (this.x > WORLD_WIDTH - this.radius) {
+                    this.x = WORLD_WIDTH - this.radius;
+                    this.angle = Math.PI - this.angle;
+                }
+                if (this.y < this.radius) { this.y = this.radius; this.angle = -this.angle; }
+                if (this.y > WORLD_HEIGHT - this.radius) { this.y = WORLD_HEIGHT - this.radius; this.angle = -this.angle; }
+
+                // Zadní zeď (levý okraj kamery)
+                if (this.x < minX + this.radius) {
+                    this.x = minX + this.radius;
+                    this.angle = Math.PI - this.angle;
+                }
+
+                if (this.body.length > 0) {
+                    this.checkBodyCollision();
+                    bounceWormOffStones(this, dt);
+                }
+
+                this.body.push({ x: this.x, y: this.y });
+
+                // Oříznutí těla na cílovou délku
+                let currentPhysicalLength = 0;
+                let cutIndex = -1;
+                for (let i = this.body.length - 1; i > 0; i--) {
+                    const p1 = this.body[i];
+                    const p2 = this.body[i - 1];
+                    currentPhysicalLength += Math.hypot(p1.x - p2.x, p1.y - p2.y);
+                    if (currentPhysicalLength > this.targetLength) {
+                        cutIndex = i - 1;
+                        break;
+                    }
+                }
+                if (cutIndex !== -1 && cutIndex > 0) {
+                    this.body.splice(0, cutIndex);
+                }
+            }
+
+            draw() {
+                const camX = camera.x;
+                for (let i = 0; i < this.body.length; i++) {
+                    const segment = this.body[i];
+                    ctx.fillStyle = this.color;
+                    ctx.beginPath();
+                    const segmentRadius = this.radius * (0.5 + (i / this.body.length) * 0.5);
+                    ctx.arc(segment.x - camX, segment.y, segmentRadius, 0, Math.PI * 2);
+                    ctx.fill();
+                }
+
+                ctx.fillStyle = this.headColor;
+                ctx.beginPath();
+                ctx.arc(this.x - camX, this.y, this.radius, 0, Math.PI * 2);
+                ctx.fill();
+
+                ctx.fillStyle = 'white';
+                ctx.beginPath();
+                ctx.arc(this.x - camX + Math.cos(this.currentMoveAngle - 0.5) * (this.radius * 0.6), this.y + Math.sin(this.currentMoveAngle - 0.5) * (this.radius * 0.6), 2, 0, Math.PI * 2);
+                ctx.arc(this.x - camX + Math.cos(this.currentMoveAngle + 0.5) * (this.radius * 0.6), this.y + Math.sin(this.currentMoveAngle + 0.5) * (this.radius * 0.6), 2, 0, Math.PI * 2);
+                ctx.fill();
+            }
+        }
+
+        // Odraz červa od kamenů (po normále elipsy)
+        function bounceWormOffStones(worm, dt) {
+            for (let i = 0; i < stones.length; i++) {
+                const stone = stones[i];
+                const maxR = Math.max(stone.rx, stone.ry);
+                const distToCenter = Math.hypot(worm.x - stone.x, worm.y - stone.y);
+
+                if (distToCenter > maxR + worm.radius) continue;
+
+                const dx = worm.x - stone.x;
+                const dy = worm.y - stone.y;
+
+                const cosA = Math.cos(-stone.rotation);
+                const sinA = Math.sin(-stone.rotation);
+
+                const localX = dx * cosA - dy * sinA;
+                const localY = dx * sinA + dy * cosA;
+
+                const normalizedX = localX / (stone.rx + worm.radius);
+                const normalizedY = localY / (stone.ry + worm.radius);
+                const distanceSq = normalizedX * normalizedX + normalizedY * normalizedY;
+
+                if (distanceSq <= 1) {
+                    const normalLocalX = localX / (stone.rx * stone.rx);
+                    const normalLocalY = localY / (stone.ry * stone.ry);
+
+                    const normalGlobalX = normalLocalX * Math.cos(stone.rotation) - normalLocalY * Math.sin(stone.rotation);
+                    const normalGlobalY = normalLocalX * Math.sin(stone.rotation) + normalLocalY * Math.cos(stone.rotation);
+
+                    const bounceAngle = Math.atan2(normalGlobalY, normalGlobalX);
+
+                    worm.angle = bounceAngle;
+                    worm.currentMoveAngle = bounceAngle;
+
+                    // Vytlačení o vzdálenost jednoho kroku základní rychlostí
+                    const pushDist = worm.currentBaseSpeed * dt;
+                    worm.x += Math.cos(bounceAngle) * pushDist;
+                    worm.y += Math.sin(bounceAngle) * pushDist;
+                }
+            }
+        }
+
+        class Bug {
+            constructor(x, y, rng) {
+                const cfg = CONFIG.bug;
+                this.x = x;
+                this.y = y;
+
+                // Velikost roste s postupem mapou
+                const progressRatio = x / WORLD_WIDTH;
+                const minRadius = cfg.radius.min;
+                const adjustedMaxWormRadius = CONFIG.worm.radius.max * cfg.radius.endFactor;
+                const currentMaxPossibleRadius = minRadius + (adjustedMaxWormRadius - minRadius) * progressRatio;
+                this.radius = minRadius + rng() * (currentMaxPossibleRadius - minRadius);
+
+                this.angle = rng() * Math.PI * 2;
+                this.color = '#795548';
+                this.speed = 0;            // px/s (počítá se v update)
+
+                // AI: 'walk' / 'turn' řízené časovačem
+                this.turnTimeLeft = 0;     // s
+                this.turnRate = 0;         // rad/s
+
+                this.isAwake = false;
+                this.walkCycle = rng() * Math.PI * 2;
+            }
+
+            update(dt, cameraX) {
+                const cfg = CONFIG.bug;
+
+                if (!this.isAwake) {
+                    if (this.x < cameraX + CONFIG.view.width + cfg.wakeDistance) {
+                        this.isAwake = true;
+                    } else {
+                        return;
+                    }
+                }
+
+                // Vzorkování před hlavou brouka
+                const s = cfg.sampling;
+                const lookAheadDist = this.radius + s.ahead;
+                let pathHitCount = 0;
+
+                for (let i = 0; i < s.count; i++) {
+                    const sampleAngleOffset = -s.spread + (s.spread * 2 * (i / (s.count - 1 || 1)));
+                    const sampleAngle = this.angle + sampleAngleOffset;
+
+                    const checkX = this.x + Math.cos(sampleAngle) * lookAheadDist;
+                    const checkY = this.y + Math.sin(sampleAngle) * lookAheadDist;
+
+                    if (checkX >= 0 && checkX < WORLD_WIDTH && checkY >= 0 && checkY < WORLD_HEIGHT) {
+                        const pixel = tCtx.getImageData(checkX, checkY, 1, 1).data;
+                        if (isPathColor(pixel[0], pixel[1], pixel[2])) {
+                            pathHitCount++;
+                        }
+                    }
+                }
+
+                const pathPercentage = pathHitCount / s.count;
+                this.speed = cfg.speed.dirt + (cfg.speed.tunnel - cfg.speed.dirt) * pathPercentage;
+
+                // AI: když nezatáčí, s danou pravděpodobností za sekundu začne zatáčet
+                if (this.turnTimeLeft <= 0) {
+                    const chanceThisStep = 1 - Math.exp(-cfg.turn.chancePerSec * dt);
+                    if (Math.random() < chanceThisStep) {
+                        this.turnTimeLeft = randRange(Math.random, cfg.turn.duration);
+                        this.turnRate = (Math.random() * 2 - 1) * cfg.turn.maxRate;
+                    }
+                }
+                if (this.turnTimeLeft > 0) {
+                    this.angle += this.turnRate * dt;
+                    this.turnTimeLeft -= dt;
+                }
+
+                this.walkCycle += cfg.walkAnim * dt;
+
+                this.x += Math.cos(this.angle) * this.speed * dt;
+                this.y += Math.sin(this.angle) * this.speed * dt;
+
+                digTunnel(this.x, this.y, this.radius + cfg.digExtra);
+
+                // Levý / pravý okraj světa – odraz
+                if (this.x > WORLD_WIDTH) { this.x = WORLD_WIDTH; this.angle = Math.PI - this.angle; }
+                if (this.x < 0) { this.x = 0; this.angle = Math.PI - this.angle; }
+
+                // Horní / spodní okraj – stočí se vodorovně a klouže podél
+                if (this.y < this.radius) {
+                    this.y = this.radius;
+                    this.angle = (Math.cos(this.angle) > 0) ? 0 : Math.PI;
+                }
+                if (this.y > WORLD_HEIGHT - this.radius) {
+                    this.y = WORLD_HEIGHT - this.radius;
+                    this.angle = (Math.cos(this.angle) > 0) ? 0 : Math.PI;
+                }
+
+                this.checkStoneCollision();
+                this.checkRootCollision();
+            }
+
+            checkStoneCollision() {
+                for (let i = 0; i < stones.length; i++) {
+                    const stone = stones[i];
+                    const maxR = Math.max(stone.rx, stone.ry);
+                    const distToCenterSq = (this.x - stone.x) ** 2 + (this.y - stone.y) ** 2;
+                    if (distToCenterSq > (maxR + this.radius) ** 2) continue;
+
+                    const dx = this.x - stone.x;
+                    const dy = this.y - stone.y;
+
+                    const cosA = Math.cos(-stone.rotation);
+                    const sinA = Math.sin(-stone.rotation);
+
+                    const localX = dx * cosA - dy * sinA;
+                    const localY = dx * sinA + dy * cosA;
+
+                    const normalizedX = localX / (stone.rx + this.radius);
+                    const normalizedY = localY / (stone.ry + this.radius);
+                    const distanceSq = normalizedX * normalizedX + normalizedY * normalizedY;
+
+                    if (distanceSq <= 1) {
+                        const normalLocalX = localX / (stone.rx * stone.rx);
+                        const normalLocalY = localY / (stone.ry * stone.ry);
+
+                        const normalGlobalX = normalLocalX * Math.cos(stone.rotation) - normalLocalY * Math.sin(stone.rotation);
+                        const normalGlobalY = normalLocalX * Math.sin(stone.rotation) + normalLocalY * Math.cos(stone.rotation);
+
+                        const normalAngle = Math.atan2(normalGlobalY, normalGlobalX);
+
+                        // Tečna, která lépe odpovídá dosavadnímu směru
+                        const t1 = normalAngle + Math.PI / 2;
+                        const t2 = normalAngle - Math.PI / 2;
+                        const diff1 = Math.abs(Math.atan2(Math.sin(t1 - this.angle), Math.cos(t1 - this.angle)));
+                        const diff2 = Math.abs(Math.atan2(Math.sin(t2 - this.angle), Math.cos(t2 - this.angle)));
+                        this.angle = diff1 < diff2 ? t1 : t2;
+
+                        // Mírně posunout ven, aby nezůstal zaseklý
+                        this.x += Math.cos(normalAngle) * 1.5;
+                        this.y += Math.sin(normalAngle) * 1.5;
+                    }
+                }
+            }
+
+            checkRootCollision() {
+                for (let r = 0; r < rootsData.length; r++) {
+                    const system = rootsData[r];
+                    for (let s = 0; s < system.length; s++) {
+                        const segment = system[s];
+
+                        if (Math.abs(this.x - segment.x) > segment.radius + this.radius) continue;
+                        if (Math.abs(this.y - segment.y) > segment.radius + this.radius) continue;
+
+                        const dx = this.x - segment.x;
+                        const dy = this.y - segment.y;
+                        const distSq = dx * dx + dy * dy;
+                        const minDist = segment.radius + this.radius;
+
+                        if (distSq < minDist * minDist) {
+                            const dist = Math.sqrt(distSq) || 0.0001;
+                            const nx = dx / dist;
+                            const ny = dy / dist;
+
+                            const normalAngle = Math.atan2(ny, nx);
+                            const t1 = normalAngle + Math.PI / 2;
+                            const t2 = normalAngle - Math.PI / 2;
+                            const diff1 = Math.abs(Math.atan2(Math.sin(t1 - this.angle), Math.cos(t1 - this.angle)));
+                            const diff2 = Math.abs(Math.atan2(Math.sin(t2 - this.angle), Math.cos(t2 - this.angle)));
+                            this.angle = diff1 < diff2 ? t1 : t2;
+
+                            this.x = segment.x + nx * minDist;
+                            this.y = segment.y + ny * minDist;
+                        }
+                    }
+                }
+            }
+
+            draw() {
+                const camX = camera.x;
+                if (this.x + this.radius < camX || this.x - this.radius > camX + canvas.width) return;
+
+                const drawX = this.x - camX;
+
+                // Nohy
+                ctx.strokeStyle = '#3E2723';
+                ctx.lineWidth = Math.max(1.5, this.radius * 0.15);
+                ctx.lineCap = 'round';
+                const baseAngles = [Math.PI / 2.5, Math.PI / 2, Math.PI - Math.PI / 2.5];
+
+                for (let i = 0; i < 3; i++) {
+                    const wiggle = Math.sin(this.walkCycle + i) * 0.4;
+
+                    const angleR = this.angle + baseAngles[i] + wiggle;
+                    ctx.beginPath();
+                    ctx.moveTo(drawX + Math.cos(this.angle + baseAngles[i]) * this.radius * 0.6,
+                               this.y + Math.sin(this.angle + baseAngles[i]) * this.radius * 0.6);
+                    ctx.lineTo(drawX + Math.cos(angleR) * this.radius * 1.4,
+                               this.y + Math.sin(angleR) * this.radius * 1.4);
+                    ctx.stroke();
+
+                    const angleL = this.angle - baseAngles[i] - wiggle;
+                    ctx.beginPath();
+                    ctx.moveTo(drawX + Math.cos(this.angle - baseAngles[i]) * this.radius * 0.6,
+                               this.y + Math.sin(this.angle - baseAngles[i]) * this.radius * 0.6);
+                    ctx.lineTo(drawX + Math.cos(angleL) * this.radius * 1.4,
+                               this.y + Math.sin(angleL) * this.radius * 1.4);
+                    ctx.stroke();
+                }
+
+                // Kusadla
+                ctx.strokeStyle = '#1a0f0a';
+                ctx.lineWidth = Math.max(2, this.radius * 0.2);
+
+                ctx.beginPath();
+                ctx.moveTo(drawX + Math.cos(this.angle - 0.3) * this.radius * 0.9, this.y + Math.sin(this.angle - 0.3) * this.radius * 0.9);
+                ctx.quadraticCurveTo(
+                    drawX + Math.cos(this.angle - 0.6) * this.radius * 1.6, this.y + Math.sin(this.angle - 0.6) * this.radius * 1.6,
+                    drawX + Math.cos(this.angle - 0.1) * this.radius * 1.4, this.y + Math.sin(this.angle - 0.1) * this.radius * 1.4
+                );
+                ctx.stroke();
+
+                ctx.beginPath();
+                ctx.moveTo(drawX + Math.cos(this.angle + 0.3) * this.radius * 0.9, this.y + Math.sin(this.angle + 0.3) * this.radius * 0.9);
+                ctx.quadraticCurveTo(
+                    drawX + Math.cos(this.angle + 0.6) * this.radius * 1.6, this.y + Math.sin(this.angle + 0.6) * this.radius * 1.6,
+                    drawX + Math.cos(this.angle + 0.1) * this.radius * 1.4, this.y + Math.sin(this.angle + 0.1) * this.radius * 1.4
+                );
+                ctx.stroke();
+
+                // Tělo
+                ctx.fillStyle = this.color;
+                ctx.beginPath();
+                ctx.arc(drawX, this.y, this.radius, 0, Math.PI * 2);
+                ctx.fill();
+
+                // Oči
+                ctx.fillStyle = 'black';
+                ctx.beginPath();
+                ctx.arc(drawX + Math.cos(this.angle - 0.4) * (this.radius * 0.6), this.y + Math.sin(this.angle - 0.4) * (this.radius * 0.6), this.radius * 0.15, 0, Math.PI * 2);
+                ctx.arc(drawX + Math.cos(this.angle + 0.4) * (this.radius * 0.6), this.y + Math.sin(this.angle + 0.4) * (this.radius * 0.6), this.radius * 0.15, 0, Math.PI * 2);
+                ctx.fill();
+            }
+        }
+
+        // =====================================================================
+        // ===== 6. GAME (reset, step, kamera, pravidla) =======================
+        // =====================================================================
+        const camera = { x: 0 };
+
+        const game = {
+            seed: 0,
+            playerCount: 1,
+            worms: [],
+            bugs: [],
+        };
+
+        function getStartPositions(playerCount) {
+            const p = CONFIG.players;
+            const midY = WORLD_HEIGHT / 2;
+            if (playerCount === 1) return [{ x: p.startX, y: midY }];
+            return [
+                { x: p.startX, y: midY - p.spacingY / 2 },
+                { x: p.startX, y: midY + p.spacingY / 2 },
+            ];
+        }
+
+        // Bezpečná zóna bez kamenů pokrývá starty pro 1 i 2 hráče,
+        // takže stejný seed dá stejnou mapu bez ohledu na počet hráčů.
+        function getAllStartPositions() {
+            return [...getStartPositions(1), ...getStartPositions(2)];
+        }
+
+        function resetGame(seed, playerCount) {
+            game.seed = seed;
+            game.playerCount = playerCount;
+            camera.x = 0;
+
+            const worldRng = mulberry32(seed);
+
+            game.worms = getStartPositions(playerCount).map((p, i) => new Worm(p.x, p.y, PLAYER_COLORS[i]));
+
+            clearTerrain();
+            initStones(worldRng, getAllStartPositions());
+            initRoots(worldRng);
+            initBugs(worldRng);
+
+            syncUrl();
+        }
+
+        function syncUrl() {
+            try {
+                const params = new URLSearchParams(location.search);
+                params.set('seed', game.seed);
+                params.set('players', game.playerCount);
+                history.replaceState(null, '', '?' + params.toString());
+            } catch (e) {
+                // file:// v některých prohlížečích nepovolí změnu URL – seed je vidět v HUD
+            }
+        }
+
+        function handleActionKey(code) {
+            if (code === 'KeyR') resetGame(game.seed, game.playerCount);       // stejná mapa
+            if (code === 'KeyN') resetGame(newRandomSeed(), game.playerCount); // nová mapa
+            if (code === 'Digit1') resetGame(game.seed, 1);
+            if (code === 'Digit2') resetGame(game.seed, 2);
+        }
+
+        // Kamera sleduje vedoucího červa jen dopředu, nikdy necouvá
+        function updateCamera(worms) {
+            const triggerX = CONFIG.view.width * CONFIG.view.cameraTrigger;
+            const leaderX = Math.max(...worms.map(w => w.x));
+            if (leaderX - camera.x > triggerX) {
+                camera.x = leaderX - triggerX;
+            }
+        }
+
+        // Jeden simulační krok (dt v sekundách)
+        function step(dt) {
+            game.worms.forEach((worm, i) => {
+                const input = readInput(getControlsFor(i, game.playerCount));
+                worm.update(dt, input, camera.x);
+            });
+
+            updateCamera(game.worms);
+
+            for (let i = 0; i < game.bugs.length; i++) {
+                game.bugs[i].update(dt, camera.x);
+            }
+        }
+
+        // =====================================================================
+        // ===== 7. RENDER + HUD ===============================================
+        // =====================================================================
+        function drawStones() {
+            const camX = camera.x;
+            for (let i = 0; i < stones.length; i++) {
+                const stone = stones[i];
+                const maxDimension = Math.max(stone.rx, stone.ry);
+
+                if (stone.x + maxDimension < camX || stone.x - maxDimension > camX + canvas.width) continue;
+
+                const drawX = stone.x - camX;
+
+                ctx.fillStyle = '#546E7A';
+                ctx.beginPath();
+                ctx.ellipse(drawX, stone.y, stone.rx, stone.ry, stone.rotation, 0, Math.PI * 2);
+                ctx.fill();
+
+                ctx.lineWidth = 4;
+                ctx.strokeStyle = '#37474F';
+                ctx.stroke();
+
+                ctx.fillStyle = 'rgba(255, 255, 255, 0.12)';
+                ctx.beginPath();
+                const highlightOffsetX = -stone.rx * 0.2;
+                const highlightOffsetY = -stone.ry * 0.2;
+                const gx = highlightOffsetX * Math.cos(stone.rotation) - highlightOffsetY * Math.sin(stone.rotation);
+                const gy = highlightOffsetX * Math.sin(stone.rotation) + highlightOffsetY * Math.cos(stone.rotation);
+                ctx.ellipse(drawX + gx, stone.y + gy, stone.rx * 0.5, stone.ry * 0.5, stone.rotation, 0, Math.PI * 2);
+                ctx.fill();
+            }
+        }
+
+        function drawRootsOverlay() {
+            const camX = camera.x;
+            for (let r = 0; r < rootsData.length; r++) {
+                const system = rootsData[r];
+                for (let s = 0; s < system.length; s++) {
+                    const segment = system[s];
+
+                    if (segment.x + segment.radius < camX || segment.x - segment.radius > camX + canvas.width) continue;
+
+                    ctx.beginPath();
+                    ctx.arc(segment.x - camX, segment.y, segment.radius, 0, Math.PI * 2);
+                    ctx.strokeStyle = 'rgba(62, 39, 35, 0.6)';
+                    ctx.lineWidth = 3;
+                    ctx.stroke();
+                }
+            }
+        }
+
+        function drawHud() {
+            ctx.font = '16px Arial';
+            ctx.fillStyle = 'white';
+            ctx.textAlign = 'left';
+            game.worms.forEach((w, i) => {
+                ctx.fillText(
+                    `P${i + 1} · Rádius: ${Math.round(w.radius)} | Rychlost: ${w.currentActualSpeed.toFixed(0)} / ${w.currentBoostSpeed.toFixed(0)} px/s`,
+                    20, 30 + i * 22
+                );
+            });
+
+            ctx.textAlign = 'right';
+            ctx.fillText(`Seed: ${game.seed} · Hráči: ${game.playerCount} · [R] restart · [N] nová mapa · [1/2] hráči`, canvas.width - 20, 30);
+            ctx.textAlign = 'left';
+        }
+
+        function render() {
+            ctx.drawImage(
+                terrainCanvas,
+                camera.x, 0, canvas.width, canvas.height,
+                0, 0, canvas.width, canvas.height
+            );
+
+            drawRootsOverlay();
+            drawStones();
+
+            for (let i = 0; i < game.bugs.length; i++) {
+                game.bugs[i].draw();
+            }
+            for (let i = 0; i < game.worms.length; i++) {
+                game.worms[i].draw();
+            }
+
+            drawHud();
+        }
+
+        // =====================================================================
+        // ===== 8. LOOP + BOOT ================================================
+        // =====================================================================
+        // Fixní simulační krok: logika běží vždy 60× za sekundu herního času,
+        // vykreslování tak často, jak to monitor dovolí.
+        const SIM_DT = 1 / CONFIG.sim.hz;
+        let accumulator = 0;
+        let lastTime = null;
+
+        function frame(now) {
+            if (lastTime === null) lastTime = now;
+            accumulator += Math.min((now - lastTime) / 1000, CONFIG.sim.maxFrameTime);
+            lastTime = now;
+
+            while (accumulator >= SIM_DT) {
+                step(SIM_DT);
+                accumulator -= SIM_DT;
+            }
+
+            render();
+            requestAnimationFrame(frame);
+        }
+
+        window.onload = function () {
+            const params = new URLSearchParams(location.search);
+            const seed = parseInt(params.get('seed'), 10) || newRandomSeed();
+            const players = params.get('players') === '2' ? 2 : CONFIG.players.count;
+
+            resetGame(seed, players);
+
+            window.focus();
+            canvas.setAttribute('tabindex', '0');
+            canvas.focus();
+
+            requestAnimationFrame(frame);
+        };
+    </script>
+</body>
+</html>
